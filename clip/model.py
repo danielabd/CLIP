@@ -1,11 +1,13 @@
 from collections import OrderedDict
 from typing import Tuple, Union
-
+from clip.Attention_utils import MultiheadAttention_with_k_v
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+import importlib.util
+if importlib.util.find_spec('flash_attn'):
+    FlashMHA = importlib.import_module('flash_attn.flash_attention').FlashMHA
 
 class Bottleneck(nn.Module):
     expansion = 4
@@ -169,10 +171,13 @@ class QuickGELU(nn.Module):
 
 
 class ResidualAttentionBlock(nn.Module):
+    # def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None, use_flash_attention: bool = False):
     def __init__(self, d_model: int, n_head: int, attn_mask: torch.Tensor = None):
         super().__init__()
 
-        self.attn = nn.MultiheadAttention(d_model, n_head)
+        # self.attn = nn.MultiheadAttention(d_model, n_head) if not use_flash_attention else FlashMHA(d_model, n_head)
+        # self.attn = nn.MultiheadAttention(d_model, n_head)
+        self.attn = MultiheadAttention_with_k_v(d_model, n_head)
         self.ln_1 = LayerNorm(d_model)
         self.mlp = nn.Sequential(OrderedDict([
             ("c_fc", nn.Linear(d_model, d_model * 4)),
@@ -181,29 +186,82 @@ class ResidualAttentionBlock(nn.Module):
         ]))
         self.ln_2 = LayerNorm(d_model)
         self.attn_mask = attn_mask
+        # self.use_flash_attention = use_flash_attention
+        # self.k = None
+        # self.v = None
 
-    def attention(self, x: torch.Tensor):
+    def attention(self, x: torch.Tensor,k_in=None, v_in=None, return_k_v=False):
         self.attn_mask = self.attn_mask.to(dtype=x.dtype, device=x.device) if self.attn_mask is not None else None
-        return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
+        # if self.use_flash_attention:
+            # Batch first is needed for FlashAttention. See https://github.com/HazyResearch/flash-attention/issues/84 for more information.
+            # return self.attn(x.transpose(1, 0))[0].transpose(1, 0) #todo: continue from here
+            # return self.attn(x, key, value, need_weights=False, attn_mask=self.attn_mask)[0]
+        # else:
+        if True:
+            #todo: check it
+            # att_val = self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]# todo: daniela
+            if k_in!=None and v_in!=None:
+                att_val, _, k, v = self.attn(x, x, x, return_k_v=return_k_v, need_weights=False, attn_mask=self.attn_mask, k_in=k_in, v_in=v_in)# todo: daniela check ik_in, v_in influence
+            else:
+                att_val, _, k, v = self.attn(x, x, x, return_k_v=return_k_v, need_weights=False, attn_mask=self.attn_mask)# todo: daniela
+            # self.k = k
+            # self.v = v
+            # return att_val
+            return att_val,k,v
+            # return self.attn(x, x, x, need_weights=False, attn_mask=self.attn_mask)[0]
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.attention(self.ln_1(x))
+    def get_k_v(self):
+        return self.k, self.v
+
+    def forward(self, x: torch.Tensor,k: list,v: list, k_in=None, v_in=None, return_k_v=False):
+    # def forward(self, x: torch.Tensor):
+        att_val,ki,vi = self.attention(self.ln_1(x),k_in,v_in,return_k_v)# daniela
+        k.append(ki)
+        v.append(vi)
+        # att_val= self.attention(self.ln_1(x))# daniela
+        # x = x + self.attention(self.ln_1(x))
+        x = x + att_val
         x = x + self.mlp(self.ln_2(x))
-        return x
-
+        return x,k,v
+        # return x
 
 class Transformer(nn.Module):
+    # def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, use_flash_attention: bool = False):
     def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None):
         super().__init__()
         self.width = width
         self.layers = layers
-        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)])
+        self.grad_checkpointing = False #todo: daniela
+        self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)]) #todo: daniela
+        # self.resblocks = nn.Sequential(*[ResidualAttentionBlock(width, heads, attn_mask, use_flash_attention) for _ in range(layers)])  #todo: daniela
+        # self.resblocks = [ResidualAttentionBlock(width, heads, attn_mask, use_flash_attention) for _ in range(layers)]  #todo: daniela
+        # self.resblocks = [ResidualAttentionBlock(width, heads, attn_mask) for _ in range(layers)]  #todo: daniela
 
-    def forward(self, x: torch.Tensor):
-        return self.resblocks(x)
+
+
+    def forward(self, x: torch.Tensor, updated_k_in=None, updated_v_in=None, return_k_v=False):
+
+        # if return_k_v:
+        #     self.k_per_layer.append(x)
+        #     self.v_per_layer.append(x)
+
+        k_per_layer = []
+        v_per_layer = []
+        for _ in range(self.layers):
+            # resblock = ResidualAttentionBlock(width, heads, attn_mask, use_flash_attention)
+            if type(updated_k_in) == list and len(updated_k_in)>_:
+                x,k_per_layer,v_per_layer = self.resblocks[_](x,k_per_layer,v_per_layer,updated_k_in[_],updated_v_in[_],return_k_v=return_k_v)
+            else:
+                x, k_per_layer, v_per_layer = self.resblocks[_](x, k_per_layer, v_per_layer,return_k_v=return_k_v)
+            # k,v = self.resblocks[_].get_k_v
+            # self.k_per_layer.append(k)
+            # self.v_per_layer.append(v)
+        return x,k_per_layer,v_per_layer
+        # return self.resblocks(x)
 
 
 class VisionTransformer(nn.Module):
+    # def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int, use_flash_attention: bool = False):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
         self.input_resolution = input_resolution
@@ -215,12 +273,13 @@ class VisionTransformer(nn.Module):
         self.positional_embedding = nn.Parameter(scale * torch.randn((input_resolution // patch_size) ** 2 + 1, width))
         self.ln_pre = LayerNorm(width)
 
+        # self.transformer = Transformer(width, layers, heads, use_flash_attention=use_flash_attention)
         self.transformer = Transformer(width, layers, heads)
 
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, updated_k_in:list, updated_v_in: list, return_k_v=False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -229,7 +288,8 @@ class VisionTransformer(nn.Module):
         x = self.ln_pre(x)
 
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        # x = self.transformer(x) #todo:daniela
+        x, k,v = self.transformer(x,updated_k_in, updated_v_in, return_k_v)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
@@ -237,7 +297,10 @@ class VisionTransformer(nn.Module):
         if self.proj is not None:
             x = x @ self.proj
 
-        return x
+        if return_k_v:
+            return x,k,v
+        else:
+            return x
 
 
 class CLIP(nn.Module):
@@ -253,7 +316,8 @@ class CLIP(nn.Module):
                  vocab_size: int,
                  transformer_width: int,
                  transformer_heads: int,
-                 transformer_layers: int
+                 transformer_layers: int,
+                 use_flash_attention: bool = False
                  ):
         super().__init__()
 
@@ -276,7 +340,8 @@ class CLIP(nn.Module):
                 width=vision_width,
                 layers=vision_layers,
                 heads=vision_heads,
-                output_dim=embed_dim
+                output_dim=embed_dim,
+                # use_flash_attention=use_flash_attention  #todo: daniela
             )
 
         self.transformer = Transformer(
@@ -337,15 +402,15 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image):
-        return self.visual(image.type(self.dtype))
+    def encode_image(self, image, use_flash_attention = False, updated_k_in=None, updated_v_in=None,return_k_v=False):
+        return self.visual(image.type(self.dtype),updated_k_in, updated_v_in, return_k_v) #todo: daniela
 
-    def encode_text(self, text):
+    def encode_text(self, text, return_k_v=False):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
         x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
+        x,_,_ = self.transformer(x,return_k_v)
         x = x.permute(1, 0, 2)  # LND -> NLD
         x = self.ln_final(x).type(self.dtype)
 
@@ -355,8 +420,8 @@ class CLIP(nn.Module):
 
         return x
 
-    def forward(self, image, text):
-        image_features = self.encode_image(image)
+    def forward(self, image, text, k=None, v=None):
+        image_features = self.encode_image(image, k, v)
         text_features = self.encode_text(text)
 
         # normalized features
@@ -396,6 +461,7 @@ def convert_weights(model: nn.Module):
     model.apply(_convert_weights_to_fp16)
 
 
+# def build_model(state_dict: dict, use_flash_attention = False):
 def build_model(state_dict: dict):
     vit = "visual.proj" in state_dict
 
@@ -420,11 +486,13 @@ def build_model(state_dict: dict):
     transformer_width = state_dict["ln_final.weight"].shape[0]
     transformer_heads = transformer_width // 64
     transformer_layers = len(set(k.split(".")[2] for k in state_dict if k.startswith("transformer.resblocks")))
+    # use_flash_attention = use_flash_attention
 
     model = CLIP(
         embed_dim,
         image_resolution, vision_layers, vision_width, vision_patch_size,
         context_length, vocab_size, transformer_width, transformer_heads, transformer_layers
+        # context_length, vocab_size, transformer_width, transformer_heads, transformer_layers, use_flash_attention
     )
 
     for key in ["input_resolution", "context_length", "vocab_size"]:
