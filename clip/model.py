@@ -213,17 +213,19 @@ class ResidualAttentionBlock(nn.Module):
     def get_k_v(self):
         return self.k, self.v
 
-    def forward(self, x: torch.Tensor,k: list,v: list, k_in=None, v_in=None, return_k_v=False):
+    def forward(self, x: torch.Tensor,k: list =None,v: list =None, k_in=None, v_in=None, return_k_v=False):
     # def forward(self, x: torch.Tensor):
         att_val,ki,vi = self.attention(self.ln_1(x),k_in,v_in,return_k_v)# daniela
-        k.append(ki)
-        v.append(vi)
         # att_val= self.attention(self.ln_1(x))# daniela
         # x = x + self.attention(self.ln_1(x))
         x = x + att_val
         x = x + self.mlp(self.ln_2(x))
-        return x,k,v
-        # return x
+        if type(k)==list and type(v)==list:
+            k.append(ki)
+            v.append(vi)
+            return x,k,v
+        else:
+            return x
 
 class Transformer(nn.Module):
     # def __init__(self, width: int, layers: int, heads: int, attn_mask: torch.Tensor = None, use_flash_attention: bool = False):
@@ -239,7 +241,7 @@ class Transformer(nn.Module):
 
 
 
-    def forward(self, x: torch.Tensor, updated_k_in=None, updated_v_in=None, return_k_v=False):
+    def forward(self, x: torch.Tensor, updated_k_in=None, updated_v_in=None, return_k_v=False, kv_only_first_layer=True):
 
         # if return_k_v:
         #     self.k_per_layer.append(x)
@@ -249,10 +251,24 @@ class Transformer(nn.Module):
         v_per_layer = []
         for _ in range(self.layers):
             # resblock = ResidualAttentionBlock(width, heads, attn_mask, use_flash_attention)
+            if kv_only_first_layer and _ == 0:
+                if _ > 0:
+                    return_k_v = False
             if type(updated_k_in) == list and len(updated_k_in)>_:
-                x,k_per_layer,v_per_layer = self.resblocks[_](x,k_per_layer,v_per_layer,updated_k_in[_],updated_v_in[_],return_k_v=return_k_v)
+                if (kv_only_first_layer and _ == 0) or not kv_only_first_layer: #update k,v lists only for the first layer
+                    x,k_per_layer,v_per_layer = self.resblocks[_](x,k_per_layer,v_per_layer,updated_k_in[_],updated_v_in[_],return_k_v=return_k_v)
+                else:
+                    if kv_only_first_layer: # not first layer
+                        x = self.resblocks[_](x, None, None, None,
+                                              None, return_k_v=return_k_v)
+                    else:
+                        x = self.resblocks[_](x, None, None, updated_k_in[_],
+                                                                    updated_v_in[_], return_k_v=return_k_v)
             else:
-                x, k_per_layer, v_per_layer = self.resblocks[_](x, k_per_layer, v_per_layer,return_k_v=return_k_v)
+                if (kv_only_first_layer and _ == 0) or not kv_only_first_layer:
+                    x, k_per_layer, v_per_layer = self.resblocks[_](x, k_per_layer, v_per_layer,return_k_v=return_k_v)
+                else:
+                    x = self.resblocks[_](x, None, None, return_k_v=return_k_v)
             # k,v = self.resblocks[_].get_k_v
             # self.k_per_layer.append(k)
             # self.v_per_layer.append(v)
@@ -279,7 +295,7 @@ class VisionTransformer(nn.Module):
         self.ln_post = LayerNorm(width)
         self.proj = nn.Parameter(scale * torch.randn(width, output_dim))
 
-    def forward(self, x: torch.Tensor, updated_k_in:list, updated_v_in: list, return_k_v=False):
+    def forward(self, x: torch.Tensor, updated_k_in:list, updated_v_in: list, return_k_v=False, kv_only_first_layer=True):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
@@ -289,7 +305,7 @@ class VisionTransformer(nn.Module):
 
         x = x.permute(1, 0, 2)  # NLD -> LND
         # x = self.transformer(x) #todo:daniela
-        x, k,v = self.transformer(x,updated_k_in, updated_v_in, return_k_v)
+        x, k,v = self.transformer(x,updated_k_in, updated_v_in, return_k_v, kv_only_first_layer)
         x = x.permute(1, 0, 2)  # LND -> NLD
 
         x = self.ln_post(x[:, 0, :])
@@ -402,8 +418,8 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image, use_flash_attention = False, updated_k_in=None, updated_v_in=None,return_k_v=False):
-        return self.visual(image.type(self.dtype),updated_k_in, updated_v_in, return_k_v) #todo: daniela
+    def encode_image(self, image, use_flash_attention = False, updated_k_in=None, updated_v_in=None,return_k_v=False,kv_only_first_layer=True):
+        return self.visual(image.type(self.dtype),updated_k_in, updated_v_in, return_k_v,kv_only_first_layer) #todo: daniela
 
     def encode_text(self, text, return_k_v=False):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
